@@ -495,6 +495,16 @@ const MAX_PROBING_TIMEOUTS: usize = 3;
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
 
+// The default duration during which packets can remain in flight without any
+// new packet being acknowledged, before the connection is closed.
+const DEFAULT_ACK_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The default number of sent packets that can be tracked for loss detection
+// before the connection is closed. This is twice the gcongestion maximum
+// congestion window, so that connections making progress are not affected.
+// The legacy congestion control algorithms don't limit the congestion window.
+const DEFAULT_MAX_OUTSTANDING_SENT_PACKETS: usize = 40_000;
+
 // The maximum data offset that can be stored in a crypto stream.
 const MAX_CRYPTO_STREAM_OFFSET: u64 = 1 << 16;
 
@@ -610,6 +620,10 @@ pub struct Config {
     track_unknown_transport_params: Option<usize>,
 
     initial_rtt: Duration,
+
+    ack_progress_timeout: Option<Duration>,
+
+    max_outstanding_sent_packets: usize,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -688,6 +702,10 @@ impl Config {
 
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
+
+            ack_progress_timeout: Some(DEFAULT_ACK_PROGRESS_TIMEOUT),
+
+            max_outstanding_sent_packets: DEFAULT_MAX_OUTSTANDING_SENT_PACKETS,
         })
     }
 
@@ -917,6 +935,40 @@ impl Config {
     /// The default value is `333`.
     pub fn set_initial_rtt(&mut self, v: Duration) {
         self.initial_rtt = v;
+    }
+
+    /// Sets how long packets can remain in flight without the peer
+    /// acknowledging any new packet, in milliseconds, before the connection is
+    /// closed.
+    ///
+    /// Unlike the idle timeout, this closes connections whose peer stops
+    /// acknowledging packets while it keeps sending packets.
+    ///
+    /// The connection is closed silently, and [`is_timed_out()`] returns
+    /// `true`, unless the connection was already closing.
+    ///
+    /// The value `0` disables this timeout. The default value is `30000`.
+    ///
+    /// [`is_timed_out()`]: struct.Connection.html#method.is_timed_out
+    pub fn set_ack_progress_timeout(&mut self, v: u64) {
+        self.ack_progress_timeout = match v {
+            0 => None,
+            v => Some(Duration::from_millis(v)),
+        };
+    }
+
+    /// Sets the number of sent packets that can be tracked for loss detection
+    /// before the connection is closed.
+    ///
+    /// This limits the memory used by a connection whose peer doesn't
+    /// acknowledge packets. The limit must be higher than the number of
+    /// packets a connection can have in flight.
+    ///
+    /// The connection is closed with a `PROTOCOL_VIOLATION` transport error.
+    ///
+    /// The value `0` disables this limit. The default value is `40000`.
+    pub fn set_max_outstanding_sent_packets(&mut self, v: usize) {
+        self.max_outstanding_sent_packets = v;
     }
 
     /// Sets the `max_idle_timeout` transport parameter, in milliseconds.
@@ -1607,6 +1659,14 @@ where
 
     /// The anti-amplification limit factor.
     max_amplification_factor: usize,
+
+    /// How long packets can remain in flight without any new packet being
+    /// acknowledged, before the connection is closed.
+    ack_progress_timeout: Option<Duration>,
+
+    /// The number of tracked sent packets after which the connection is
+    /// closed.
+    max_outstanding_sent_packets: usize,
 }
 
 /// Creates a new server-side connection.
@@ -2231,6 +2291,10 @@ impl<F: BufFactory> Connection<F> {
             streams_blocked_uni_state: Default::default(),
 
             max_amplification_factor: config.max_amplification_factor,
+
+            ack_progress_timeout: config.ack_progress_timeout,
+
+            max_outstanding_sent_packets: config.max_outstanding_sent_packets,
         };
         if let Some(retry_cids) = retry_cids {
             conn.local_transport_params
@@ -4074,16 +4138,6 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::Done);
         }
 
-        let has_loss_probe = {
-            let send_path = self.paths.get(send_pid)?;
-
-            packet::Epoch::epochs(
-                packet::Epoch::Initial..=packet::Epoch::Application,
-            )
-            .iter()
-            .any(|&epoch| send_path.recovery.loss_probes(epoch) > 0)
-        };
-
         if self.local_error.is_none() {
             for &epoch in packet::Epoch::epochs(
                 packet::Epoch::Initial..=packet::Epoch::Application,
@@ -4112,9 +4166,12 @@ impl<F: BufFactory> Connection<F> {
 
         let pkt_type = self.write_pkt_type(send_pid)?;
         let epoch = pkt_type.to_epoch()?;
+        // CONNECTION_CLOSE frames are not ack-eliciting, so they are not
+        // congestion controlled (RFC 9002 Section 2), and must not be delayed
+        // when the congestion window is full of unacknowledged packets.
         let bypass_cwnd = self.paths.get(send_pid)?.recovery.loss_probes(epoch) >
             0 ||
-            (self.local_error.is_some() && has_loss_probe);
+            self.local_error.is_some();
 
         self.send_single_for_type(
             out,
@@ -5591,6 +5648,12 @@ impl<F: BufFactory> Connection<F> {
     ) -> Result<()> {
         let path = self.paths.get_mut(send_pid)?;
 
+        // The ack progress timeout starts when packets are sent while none were
+        // in flight.
+        if sent_pkt.in_flight && path.recovery.bytes_in_flight() == 0 {
+            path.last_ack_progress = Some(now);
+        }
+
         // The skip counter may use values from an inactive path.
         let cwnd = path.recovery.cwnd();
         let max_datagram_size = path.recovery.max_datagram_size();
@@ -5608,6 +5671,34 @@ impl<F: BufFactory> Connection<F> {
             now,
             &self.trace_id,
         );
+
+        // Sent packets are only discarded once acknowledged or declared lost,
+        // so a peer that doesn't acknowledge packets is misbehaving
+        if self.max_outstanding_sent_packets > 0 {
+            let tracked_sent_packets: usize = packet::Epoch::epochs(
+                packet::Epoch::Initial..=packet::Epoch::Application,
+            )
+            .iter()
+            .map(|&e| path.recovery.sent_packets_len(e))
+            .sum();
+
+            if tracked_sent_packets > self.max_outstanding_sent_packets {
+                trace!(
+                    "{} too many outstanding sent packets: {}",
+                    self.trace_id,
+                    tracked_sent_packets
+                );
+
+                // The peer doesn't acknowledge ack-eliciting packets, as
+                // required by RFC 9000 Section 13.2.1.
+                self.close(
+                    false,
+                    WireErrorCode::ProtocolViolation as u64,
+                    b"too many outstanding sent packets",
+                )
+                .ok();
+            }
+        }
 
         Ok(())
     }
@@ -7090,10 +7181,38 @@ impl<F: BufFactory> Connection<F> {
                 .as_ref()
                 .map(|key_update| key_update.timer);
 
-            let timers = [self.idle_timer, path_timer, key_update_timer];
+            let timers = [
+                self.idle_timer,
+                path_timer,
+                key_update_timer,
+                self.ack_progress_timer(),
+            ];
 
             timers.iter().filter_map(|&x| x).min()
         }
+    }
+
+    /// Returns when the connection is closed, if packets in flight aren't
+    /// acknowledged.
+    fn ack_progress_timer(&self) -> Option<Instant> {
+        let timeout = self.ack_progress_timeout?;
+
+        // Only the active path is considered, as packets sent on other paths,
+        // such as path probes, might never be acknowledged.
+        let path = self.paths.get_active().ok()?;
+
+        if path.recovery.bytes_in_flight() == 0 {
+            return None;
+        }
+
+        // Like the idle timeout, allow multiple PTOs to expire before closing,
+        // including the peer's maximum ACK delay.
+        let max_ack_delay =
+            Duration::from_millis(self.peer_transport_params.max_ack_delay);
+        let timeout =
+            cmp::max(timeout, 3 * (path.recovery.pto() + max_ack_delay));
+
+        path.last_ack_progress.map(|t| t + timeout)
     }
 
     /// Returns the amount of time until the next timeout event.
@@ -7139,6 +7258,20 @@ impl<F: BufFactory> Connection<F> {
 
                 self.mark_closed();
                 self.timed_out = true;
+                return;
+            }
+        }
+
+        if let Some(timer) = self.ack_progress_timer() {
+            if timer <= now {
+                trace!("{} ack progress timeout expired", self.trace_id);
+
+                // Don't report a timeout if the connection was already closing.
+                if self.local_error.is_none() {
+                    self.timed_out = true;
+                }
+
+                self.mark_closed();
                 return;
             }
         }
@@ -7859,7 +7992,8 @@ impl<F: BufFactory> Connection<F> {
         self.closed
     }
 
-    /// Returns true if the connection was closed due to the idle timeout.
+    /// Returns true if the connection was closed due to the idle timeout, or
+    /// the ack progress timeout.
     #[inline]
     pub fn is_timed_out(&self) -> bool {
         self.timed_out
@@ -8448,6 +8582,12 @@ impl<F: BufFactory> Connection<F> {
                     self.lost_bytes += lost_bytes as u64;
                     self.acked_bytes += acked_bytes as u64;
                     self.spurious_lost_count += spurious_losses;
+
+                    // Only acknowledging packets in flight counts as progress,
+                    // not acknowledging ACK-only packets.
+                    if acked_bytes > 0 {
+                        p.last_ack_progress = Some(now);
+                    }
                 }
             },
 

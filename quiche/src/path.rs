@@ -252,6 +252,10 @@ pub struct Path {
 
     /// Whether or not we should force eliciting of an ACK (e.g. via PING frame)
     pub needs_ack_eliciting: bool,
+
+    /// The last time packets in flight on this path were acknowledged, or
+    /// packets were sent on this path while none were in flight.
+    pub last_ack_progress: Option<Instant>,
 }
 
 impl Path {
@@ -320,6 +324,7 @@ impl Path {
             failure_notified: false,
             migrating: false,
             needs_ack_eliciting: false,
+            last_ack_progress: None,
         }
     }
 

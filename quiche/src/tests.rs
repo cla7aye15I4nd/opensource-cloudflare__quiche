@@ -7984,6 +7984,255 @@ fn limit_ack_ranges(
 }
 
 #[rstest]
+/// The server closes the connection once it tracks more than the maximum
+/// number of outstanding sent packets.
+fn max_outstanding_sent_packets(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // The client sends a request, which the server answers with stream data
+    // that the client never receives, and so never acknowledges.
+    assert_eq!(pipe.client.stream_send(0, b"GET /", true), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert_eq!(pipe.server.stream_send(0, b"response", false), Ok(8));
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+
+    // The client drops all the packets sent by the server.
+    let frames = [frame::Frame::Ping { mtu_probe: None }];
+    let mut peer_pkts = 0;
+
+    while pipe.server.local_error().is_none() {
+        assert!(peer_pkts <= DEFAULT_MAX_OUTSTANDING_SENT_PACKETS);
+
+        pipe.send_pkt_to_server(Type::Short, &frames, &mut buf)
+            .unwrap();
+
+        peer_pkts += 1;
+    }
+
+    let recovery = &pipe.server.paths.get_active().unwrap().recovery;
+    let tracked_sent_packets: usize = packet::Epoch::epochs(
+        packet::Epoch::Initial..=packet::Epoch::Application,
+    )
+    .iter()
+    .map(|&e| recovery.sent_packets_len(e))
+    .sum();
+    assert_eq!(
+        tracked_sent_packets,
+        DEFAULT_MAX_OUTSTANDING_SENT_PACKETS + 1
+    );
+
+    let error = ConnectionError {
+        is_app: false,
+        error_code: WireErrorCode::ProtocolViolation as u64,
+        reason: b"too many outstanding sent packets".to_vec(),
+    };
+    assert_eq!(pipe.server.local_error(), Some(&error));
+
+    // The CONNECTION_CLOSE frame is sent right away, even though the
+    // congestion window is full of unacknowledged packets.
+    let recovery = &pipe.server.paths.get_active().unwrap().recovery;
+    let cwnd_available = recovery.cwnd_available();
+
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    assert!(len > cwnd_available);
+    assert!(pipe.server.is_draining());
+
+    assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
+    assert_eq!(pipe.client.peer_error(), Some(&error));
+}
+
+// The ack progress timeout used by tests. Tests wait for it in real time, so
+// it is large enough to tolerate the test thread being descheduled.
+const TEST_ACK_PROGRESS_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[rstest]
+/// The server closes the connection once the ack progress timeout expires,
+/// unless that timeout is disabled.
+fn ack_progress_timeout(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(true, false)] enabled: bool,
+) {
+    let mut buf = [0; 65535];
+
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_ack_progress_timeout(if enabled {
+        TEST_ACK_PROGRESS_TIMEOUT.as_millis() as u64
+    } else {
+        0
+    });
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // The client sends a request, which the server answers with stream data
+    // that the client never receives, and so never acknowledges.
+    assert_eq!(pipe.client.stream_send(0, b"GET /", true), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let start = Instant::now();
+    assert_eq!(pipe.server.stream_send(0, b"response", false), Ok(8));
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+
+    // The client drops all the packets sent by the server.
+    let frames = [frame::Frame::Ping { mtu_probe: None }];
+
+    loop {
+        assert!(pipe
+            .send_pkt_to_server(Type::Short, &frames, &mut buf)
+            .is_ok());
+
+        std::thread::sleep(Duration::from_millis(10));
+        pipe.server.on_timeout();
+
+        while pipe.server.send(&mut buf).is_ok() {}
+
+        if pipe.server.is_closed() ||
+            start.elapsed() > TEST_ACK_PROGRESS_TIMEOUT * 2
+        {
+            break;
+        }
+    }
+
+    if !enabled {
+        assert!(!pipe.server.is_closed());
+        assert!(!pipe.server.is_timed_out());
+        assert_eq!(pipe.server.local_error(), None);
+        return;
+    }
+
+    // The connection is closed silently, without a CONNECTION_CLOSE frame.
+    assert!(pipe.server.is_closed());
+    assert!(pipe.server.is_timed_out());
+    assert!(start.elapsed() >= TEST_ACK_PROGRESS_TIMEOUT);
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+#[rstest]
+/// The ack progress timeout is at least three times the PTO, including the
+/// peer's maximum ACK delay.
+fn ack_progress_timeout_minimum(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    const MAX_ACK_DELAY: Duration = Duration::from_millis(200);
+
+    let mut client_config =
+        test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    client_config.set_max_ack_delay(MAX_ACK_DELAY.as_millis() as u64);
+
+    let mut server_config =
+        test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    server_config.set_ack_progress_timeout(1);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let start = Instant::now();
+    assert_eq!(pipe.server.send_ack_eliciting(), Ok(()));
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+
+    let timer = pipe.server.ack_progress_timer().unwrap();
+    assert!(timer >= start + 3 * MAX_ACK_DELAY);
+}
+
+#[rstest]
+/// When the ack progress timeout expires while the connection is already
+/// closing, it isn't reported as timed out.
+fn ack_progress_timeout_while_closing(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_ack_progress_timeout(TEST_ACK_PROGRESS_TIMEOUT.as_millis() as u64);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // The server sends a packet that is never acknowledged, and closes the
+    // connection, but doesn't get to send the CONNECTION_CLOSE frame.
+    assert_eq!(pipe.server.send_ack_eliciting(), Ok(()));
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+    assert_eq!(pipe.server.close(true, 0x1, b"bye"), Ok(()));
+
+    let timeout = pipe.server.timeout().unwrap();
+    std::thread::sleep(timeout.max(TEST_ACK_PROGRESS_TIMEOUT));
+    pipe.server.on_timeout();
+
+    assert!(pipe.server.is_closed());
+    assert!(!pipe.server.is_timed_out());
+}
+
+#[rstest]
+/// The ack progress timeout doesn't expire while packets remain in flight, as
+/// long as the peer keeps acknowledging new packets, nor while no packets are
+/// in flight.
+fn ack_progress_timeout_reset_by_acks(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_ack_progress_timeout(TEST_ACK_PROGRESS_TIMEOUT.as_millis() as u64);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let start = Instant::now();
+    assert_eq!(pipe.server.send_ack_eliciting(), Ok(()));
+    let mut in_flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+
+    while start.elapsed() < TEST_ACK_PROGRESS_TIMEOUT * 2 {
+        // The client acknowledges the server's packets...
+        assert_eq!(
+            test_utils::process_flight(&mut pipe.client, in_flight),
+            Ok(())
+        );
+        let acks = test_utils::emit_flight(&mut pipe.client).unwrap();
+
+        // ... but the server sends new packets before receiving the ACKs, so
+        // that packets always remain in flight.
+        assert_eq!(pipe.server.send_ack_eliciting(), Ok(()));
+        in_flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+
+        assert_eq!(test_utils::process_flight(&mut pipe.server, acks), Ok(()));
+
+        let recovery = &pipe.server.paths.get_active().unwrap().recovery;
+        assert!(recovery.bytes_in_flight() > 0);
+
+        std::thread::sleep(Duration::from_millis(10));
+        pipe.server.on_timeout();
+
+        assert!(!pipe.server.is_closed());
+    }
+
+    // Once all packets are acknowledged, the connection stays open while idle.
+    assert_eq!(
+        test_utils::process_flight(&mut pipe.client, in_flight),
+        Ok(())
+    );
+    let acks = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert_eq!(test_utils::process_flight(&mut pipe.server, acks), Ok(()));
+
+    let recovery = &pipe.server.paths.get_active().unwrap().recovery;
+    assert_eq!(recovery.bytes_in_flight(), 0);
+
+    std::thread::sleep(TEST_ACK_PROGRESS_TIMEOUT * 2);
+    pipe.server.on_timeout();
+
+    assert!(!pipe.server.is_closed());
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+#[rstest]
 /// Tests that streams are correctly scheduled based on their priority.
 fn stream_priority(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
@@ -11583,6 +11832,175 @@ fn failed_path_validation(
         pipe.client.path_event_next(),
         Some(PathEvent::FailedValidation(client_addr_2, server_addr)),
     );
+}
+
+#[rstest]
+/// Packets sent on a path that failed its validation are never acknowledged,
+/// and must not make the ack progress timeout expire on an idle connection.
+fn ack_progress_timeout_failed_path_validation(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    config.verify_peer(false);
+    config.set_active_connection_id_limit(2);
+    config.set_ack_progress_timeout(TEST_ACK_PROGRESS_TIMEOUT.as_millis() as u64);
+    // The probed path has no RTT sample, keep its PTO short.
+    config.set_initial_rtt(Duration::from_millis(10));
+
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+
+    let probed_pid = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(client_addr_2, server_addr))
+        .unwrap();
+
+    for _ in 0..MAX_PROBING_TIMEOUTS {
+        // The client creates the PATH CHALLENGE, but it is always lost.
+        test_utils::emit_flight(&mut pipe.client).unwrap();
+
+        let probe_instant = pipe
+            .client
+            .paths
+            .get(probed_pid)
+            .unwrap()
+            .recovery
+            .loss_detection_timer()
+            .unwrap();
+        let timer = probe_instant.duration_since(Instant::now());
+        std::thread::sleep(timer + Duration::from_millis(1));
+
+        pipe.client.on_timeout();
+    }
+
+    assert_eq!(
+        pipe.client.path_event_next(),
+        Some(PathEvent::FailedValidation(client_addr_2, server_addr)),
+    );
+
+    // The failed path still has packets in flight, while the active path is
+    // idle.
+    let failed_path = pipe.client.paths.get(probed_pid).unwrap();
+    assert!(failed_path.recovery.bytes_in_flight() > 0);
+
+    let active_path = pipe.client.paths.get_active().unwrap();
+    assert_eq!(active_path.recovery.bytes_in_flight(), 0);
+
+    std::thread::sleep(TEST_ACK_PROGRESS_TIMEOUT * 2);
+    pipe.client.on_timeout();
+
+    assert!(!pipe.client.is_closed());
+    assert_eq!(pipe.client.local_error(), None);
+}
+
+#[rstest]
+/// The ack progress timeout also closes connections before the handshake
+/// completes, when the peer never responds.
+fn ack_progress_timeout_handshake(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_ack_progress_timeout(TEST_ACK_PROGRESS_TIMEOUT.as_millis() as u64);
+    // There is no RTT sample yet, keep the PTO short.
+    config.set_initial_rtt(Duration::from_millis(10));
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+
+    let start = Instant::now();
+
+    // The client's packets never reach the server.
+    loop {
+        while pipe.client.send(&mut buf).is_ok() {}
+
+        if pipe.client.is_closed() ||
+            start.elapsed() > TEST_ACK_PROGRESS_TIMEOUT * 4
+        {
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+        pipe.client.on_timeout();
+    }
+
+    assert!(!pipe.client.is_established());
+    assert!(pipe.client.is_closed());
+    assert!(pipe.client.is_timed_out());
+    assert!(start.elapsed() >= TEST_ACK_PROGRESS_TIMEOUT);
+}
+
+#[rstest]
+/// The ack progress timeout doesn't expire after the connection migrates to a
+/// new path, as long as packets are acknowledged on it, even if packets sent
+/// on the previous path are never acknowledged.
+fn ack_progress_timeout_connection_migration(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    config.verify_peer(false);
+    config.set_active_connection_id_limit(3);
+    config.set_ack_progress_timeout(TEST_ACK_PROGRESS_TIMEOUT.as_millis() as u64);
+
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 2);
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    // The server sends a packet on the current path that the client never
+    // receives.
+    assert_eq!(pipe.server.send_ack_eliciting(), Ok(()));
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+
+    assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.client.migrate(client_addr_2, server_addr), Ok(1));
+    assert_eq!(pipe.client.send_ack_eliciting(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let server_path = pipe.server.paths.get_active().unwrap();
+    assert_eq!(server_path.peer_addr(), client_addr_2);
+
+    let start = Instant::now();
+
+    while start.elapsed() < TEST_ACK_PROGRESS_TIMEOUT * 2 {
+        assert_eq!(pipe.client.send_ack_eliciting(), Ok(()));
+        assert_eq!(pipe.server.send_ack_eliciting(), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        std::thread::sleep(Duration::from_millis(10));
+        pipe.client.on_timeout();
+        pipe.server.on_timeout();
+
+        assert!(!pipe.client.is_closed());
+        assert!(!pipe.server.is_closed());
+    }
 }
 
 #[rstest]
